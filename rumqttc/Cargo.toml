@@ -63,25 +63,6 @@ pretty_assertions = "1"
 pretty_env_logger = "0.5"
 serde = { version = "1", features = ["derive"] }
 
-[[example]]
-name = "async_mtd"
-path = "examples/asyncpubsub_mtd.rs"
-required-features = ["libmqttmtd/crypto_ring", "std"]
-
-[[example]]
-name = "async_mtdv5"
-path = "examples/asyncpubsub_mtd_v5.rs"
-required-features = ["libmqttmtd/crypto_ring", "std"]
-
-[[example]]
-name = "sync_mtd"
-path = "examples/syncpubsub_mtd.rs"
-required-features = ["libmqttmtd/crypto_ring", "std"]
-
-[[example]]
-name = "sync_mtdv5"
-path = "examples/syncpubsub_mtd_v5.rs"
-required-features = ["libmqttmtd/crypto_ring", "std"]
 
 [[example]]
 name = "tls"

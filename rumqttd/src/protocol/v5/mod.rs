@@ -37,6 +37,7 @@ pub enum PacketType {
     PingReq,
     PingResp,
     Disconnect,
+    Auth,
 }
 
 #[repr(u8)]
@@ -123,6 +124,7 @@ impl FixedHeader {
             12 => Ok(PacketType::PingReq),
             13 => Ok(PacketType::PingResp),
             14 => Ok(PacketType::Disconnect),
+            15 => Ok(PacketType::Auth),
             _ => Err(Error::InvalidPacketType(num)),
         }
     }
