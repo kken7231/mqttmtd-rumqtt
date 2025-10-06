@@ -1,0 +1,20 @@
+{
+	"folders": [
+		{
+			"name": "mqttmtd-gateway-rs",
+			"path": "../../../../mqttmtd-gateway-rs"
+		},
+		{
+			"name": "libmqttmtd-rs",
+			"path": "../../../../libmqttmtd-rs"
+		},
+		{
+			"name": "research-mqtt-mtd",
+			"path": "../../../../research-mqtt-mtd"
+		},
+		{
+			"path": "../../.."
+		}
+	],
+	"settings": {}
+}
