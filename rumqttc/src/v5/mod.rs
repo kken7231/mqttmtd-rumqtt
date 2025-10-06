@@ -12,6 +12,7 @@ mod client;
 mod eventloop;
 mod framed;
 pub mod mqttbytes;
+mod mtd_client;
 mod state;
 
 use crate::Outgoing;
@@ -22,6 +23,8 @@ use mqttbytes::v5::*;
 pub use client::{
     AsyncClient, Client, ClientError, Connection, Iter, RecvError, RecvTimeoutError, TryRecvError,
 };
+pub use mtd_client::{MqttMtdAsyncClient, MqttMtdClient, MqttMtdConnection, MqttMtdIter};
+
 pub use eventloop::{ConnectionError, Event, EventLoop};
 pub use state::{MqttState, StateError};
 

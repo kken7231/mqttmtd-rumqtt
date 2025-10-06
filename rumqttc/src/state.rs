@@ -3,6 +3,7 @@ use crate::{Event, Incoming, Outgoing, Request};
 use crate::mqttbytes::v4::*;
 use crate::mqttbytes::{self, *};
 use fixedbitset::FixedBitSet;
+use log::{debug, error, info};
 use std::collections::VecDeque;
 use std::{io, time::Instant};
 

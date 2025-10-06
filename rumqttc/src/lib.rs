@@ -95,9 +95,6 @@
 //! address and use that name in your code.
 #![cfg_attr(docsrs, feature(doc_cfg))]
 
-#[macro_use]
-extern crate log;
-
 use std::fmt::{self, Debug, Formatter};
 
 #[cfg(any(feature = "use-rustls-no-provider", feature = "websocket"))]
@@ -109,6 +106,7 @@ mod client;
 mod eventloop;
 mod framed;
 pub mod mqttbytes;
+mod mtd_client;
 mod state;
 pub mod v5;
 
@@ -140,6 +138,7 @@ pub use client::{
 pub use eventloop::{ConnectionError, Event, EventLoop};
 pub use mqttbytes::v4::*;
 pub use mqttbytes::*;
+pub use mtd_client::{MqttMtdAsyncClient, MqttMtdClient, MqttMtdConnection, MqttMtdIter};
 #[cfg(feature = "use-rustls-no-provider")]
 use rustls_native_certs::load_native_certs;
 pub use state::{MqttState, StateError};

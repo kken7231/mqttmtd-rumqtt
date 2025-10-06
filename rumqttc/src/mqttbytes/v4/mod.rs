@@ -5,6 +5,7 @@ mod connack;
 mod connect;
 mod disconnect;
 mod ping;
+mod preconnect;
 mod puback;
 mod pubcomp;
 mod publish;
@@ -20,6 +21,7 @@ pub use connack::*;
 pub use connect::*;
 pub use disconnect::*;
 pub use ping::*;
+pub use preconnect::*;
 pub use puback::*;
 pub use pubcomp::*;
 pub use publish::*;
@@ -33,6 +35,7 @@ pub use unsubscribe::*;
 /// Encapsulates all MQTT packet types
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Packet {
+    PreConnect(PreConnect),
     Connect(Connect),
     ConnAck(ConnAck),
     Publish(Publish),
@@ -52,6 +55,7 @@ pub enum Packet {
 impl Packet {
     pub fn size(&self) -> usize {
         match self {
+            Self::PreConnect(preconnect) => preconnect.size(),
             Self::Publish(publish) => publish.size(),
             Self::Subscribe(subscription) => subscription.size(),
             Self::Unsubscribe(unsubscribe) => unsubscribe.size(),
@@ -105,6 +109,7 @@ impl Packet {
             PacketType::PingReq => Packet::PingReq,
             PacketType::PingResp => Packet::PingResp,
             PacketType::Disconnect => Packet::Disconnect,
+            PacketType::PreConnect => Packet::PreConnect(PreConnect::read(fixed_header, packet)?),
         };
 
         Ok(packet)
@@ -120,6 +125,7 @@ impl Packet {
         }
 
         match self {
+            Packet::PreConnect(p) => p.write(stream),
             Packet::Connect(c) => c.write(stream),
             Packet::ConnAck(c) => c.write(stream),
             Packet::Publish(p) => p.write(stream),
