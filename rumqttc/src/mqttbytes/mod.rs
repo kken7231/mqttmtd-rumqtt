@@ -35,6 +35,8 @@ pub enum Error {
     InvalidQoS(u8),
     #[error("Invalid subscribe reason code: {0}")]
     InvalidSubscribeReasonCode(u8),
+    #[error("Invalid preconnect payload type = {0}")]
+    InvalidPreconnectPayloadType(u8),
     #[error("Packet id Zero")]
     PacketIdZero,
     #[error("Payload size is incorrect")]
@@ -84,6 +86,7 @@ pub enum PacketType {
     PingReq,
     PingResp,
     Disconnect,
+    PreConnect,
 }
 
 /// Protocol type

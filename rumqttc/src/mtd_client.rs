@@ -1,39 +1,26 @@
-//! This module offers a high level synchronous and asynchronous abstraction to
-//! async eventloop.
+use std::marker::PhantomData;
 use std::time::Duration;
 
+use crate::client::{get_ack_req, resolve_event, subscribe_has_valid_filters};
+use crate::eventloop::MqttMtdEventLoop;
 use crate::mqttbytes::{v4::*, QoS};
-use crate::{valid_filter, valid_topic, ConnectionError, Event, EventLoop, MqttOptions, Request};
+use crate::{
+    valid_topic, ClientError, ConnectionError, Event, MqttOptions, RecvError, RecvTimeoutError,
+    Request, TryRecvError,
+};
 
 use bytes::Bytes;
-use flume::{SendError, Sender, TrySendError};
+use flume::Sender;
 use futures_util::FutureExt;
-use log::trace;
+use libmqttmtd::crypto::aead::AeadHandler;
+use libmqttmtd::crypto::ephemeral::KeyAgreementHandler;
+use libmqttmtd::crypto::hmac::HmacHandler;
+use libmqttmtd::crypto::signature::DigitalSignatureHandler;
+use libmqttmtd::handshake::client::MqttMtdClientOptions;
 use tokio::runtime::{self, Runtime};
 use tokio::time::timeout;
 
-/// Client Error
-#[derive(Debug, thiserror::Error)]
-pub enum ClientError {
-    #[error("Failed to send mqtt requests to eventloop")]
-    Request(Request),
-    #[error("Failed to send mqtt requests to eventloop")]
-    TryRequest(Request),
-}
-
-impl From<SendError<Request>> for ClientError {
-    fn from(e: SendError<Request>) -> Self {
-        Self::Request(e.into_inner())
-    }
-}
-
-impl From<TrySendError<Request>> for ClientError {
-    fn from(e: TrySendError<Request>) -> Self {
-        Self::TryRequest(e.into_inner())
-    }
-}
-
-/// An asynchronous client, communicates with MQTT `EventLoop`.
+/// An asynchronous MQTT-MTD client, communicates with MQTT `EventLoop`.
 ///
 /// This is cloneable and can be used to asynchronously [`publish`](`AsyncClient::publish`),
 /// [`subscribe`](`AsyncClient::subscribe`) through the `EventLoop`, which is to be polled parallelly.
@@ -41,32 +28,62 @@ impl From<TrySendError<Request>> for ClientError {
 /// **NOTE**: The `EventLoop` must be regularly polled in order to send, receive and process packets
 /// from the broker, i.e. move ahead.
 #[derive(Clone, Debug)]
-pub struct AsyncClient {
+pub struct MqttMtdAsyncClient<
+    H: HmacHandler,
+    E: KeyAgreementHandler,
+    A: AeadHandler,
+    D: DigitalSignatureHandler,
+> {
     request_tx: Sender<Request>,
+    _p_h: PhantomData<H>,
+    _p_e: PhantomData<E>,
+    _p_a: PhantomData<A>,
+    _p_d: PhantomData<D>,
 }
 
-impl AsyncClient {
-    /// Create a new `AsyncClient`.
+impl<H: HmacHandler, E: KeyAgreementHandler, A: AeadHandler, D: DigitalSignatureHandler>
+    MqttMtdAsyncClient<H, E, A, D>
+{
+    /// Create a new `MqttMtdAsyncClient`.
     ///
     /// `cap` specifies the capacity of the bounded async channel.
-    pub fn new(options: MqttOptions, cap: usize) -> (AsyncClient, EventLoop) {
-        let eventloop = EventLoop::new(options, cap);
+    pub fn new<'a>(
+        options: MqttOptions,
+        mtd_options: MqttMtdClientOptions<'a, H, E, A, D>,
+        cap: usize,
+    ) -> (
+        MqttMtdAsyncClient<H, E, A, D>,
+        MqttMtdEventLoop<'a, H, E, A, D>,
+    ) {
+        let eventloop = MqttMtdEventLoop::new(options, mtd_options, cap);
         let request_tx = eventloop.requests_tx.clone();
 
-        let client = AsyncClient { request_tx };
+        let client: MqttMtdAsyncClient<H, E, A, D> = MqttMtdAsyncClient {
+            request_tx,
+            _p_h: PhantomData,
+            _p_e: PhantomData,
+            _p_a: PhantomData,
+            _p_d: PhantomData,
+        };
 
         (client, eventloop)
     }
 
-    /// Create a new `AsyncClient` from a channel `Sender`.
+    /// Create a new `MqttMtdAsyncClient` from a channel `Sender`.
     ///
     /// This is mostly useful for creating a test instance where you can
     /// listen on the corresponding receiver.
-    pub fn from_senders(request_tx: Sender<Request>) -> AsyncClient {
-        AsyncClient { request_tx }
+    pub fn from_senders(request_tx: Sender<Request>) -> MqttMtdAsyncClient<H, E, A, D> {
+        MqttMtdAsyncClient {
+            request_tx,
+            _p_h: PhantomData,
+            _p_e: PhantomData,
+            _p_a: PhantomData,
+            _p_d: PhantomData,
+        }
     }
 
-    /// Sends a MQTT Publish to the `EventLoop`.
+    /// Sends a MQTT Publish to the `MqttMtdEventLoop`.
     pub async fn publish<S, V>(
         &self,
         topic: S,
@@ -89,7 +106,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Attempts to send a MQTT Publish to the `EventLoop`.
+    /// Attempts to send a MQTT Publish to the `MqttMtdEventLoop`.
     pub fn try_publish<S, V>(
         &self,
         topic: S,
@@ -112,7 +129,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sends a MQTT PubAck to the `EventLoop`. Only needed in if `manual_acks` flag is set.
+    /// Sends a MQTT PubAck to the `MqttMtdEventLoop`. Only needed in if `manual_acks` flag is set.
     pub async fn ack(&self, publish: &Publish) -> Result<(), ClientError> {
         let ack = get_ack_req(publish);
 
@@ -122,7 +139,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Attempts to send a MQTT PubAck to the `EventLoop`. Only needed in if `manual_acks` flag is set.
+    /// Attempts to send a MQTT PubAck to the `MqttMtdEventLoop`. Only needed in if `manual_acks` flag is set.
     pub fn try_ack(&self, publish: &Publish) -> Result<(), ClientError> {
         let ack = get_ack_req(publish);
         if let Some(ack) = ack {
@@ -131,7 +148,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sends a MQTT Publish to the `EventLoop`
+    /// Sends a MQTT Publish to the `MqttMtdEventLoop`
     pub async fn publish_bytes<S>(
         &self,
         topic: S,
@@ -149,7 +166,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sends a MQTT Subscribe to the `EventLoop`
+    /// Sends a MQTT Subscribe to the `MqttMtdEventLoop`
     pub async fn subscribe<S: Into<String>>(&self, topic: S, qos: QoS) -> Result<(), ClientError> {
         let subscribe = Subscribe::new(topic, qos);
         if !subscribe_has_valid_filters(&subscribe) {
@@ -160,7 +177,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Attempts to send a MQTT Subscribe to the `EventLoop`
+    /// Attempts to send a MQTT Subscribe to the `MqttMtdEventLoop`
     pub fn try_subscribe<S: Into<String>>(&self, topic: S, qos: QoS) -> Result<(), ClientError> {
         let subscribe = Subscribe::new(topic, qos);
         if !subscribe_has_valid_filters(&subscribe) {
@@ -171,7 +188,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sends a MQTT Subscribe for multiple topics to the `EventLoop`
+    /// Sends a MQTT Subscribe for multiple topics to the `MqttMtdEventLoop`
     pub async fn subscribe_many<T>(&self, topics: T) -> Result<(), ClientError>
     where
         T: IntoIterator<Item = SubscribeFilter>,
@@ -185,7 +202,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Attempts to send a MQTT Subscribe for multiple topics to the `EventLoop`
+    /// Attempts to send a MQTT Subscribe for multiple topics to the `MqttMtdEventLoop`
     pub fn try_subscribe_many<T>(&self, topics: T) -> Result<(), ClientError>
     where
         T: IntoIterator<Item = SubscribeFilter>,
@@ -198,7 +215,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sends a MQTT Unsubscribe to the `EventLoop`
+    /// Sends a MQTT Unsubscribe to the `MqttMtdEventLoop`
     pub async fn unsubscribe<S: Into<String>>(&self, topic: S) -> Result<(), ClientError> {
         let unsubscribe = Unsubscribe::new(topic.into());
         let request = Request::Unsubscribe(unsubscribe);
@@ -206,7 +223,7 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Attempts to send a MQTT Unsubscribe to the `EventLoop`
+    /// Attempts to send a MQTT Unsubscribe to the `MqttMtdEventLoop`
     pub fn try_unsubscribe<S: Into<String>>(&self, topic: S) -> Result<(), ClientError> {
         let unsubscribe = Unsubscribe::new(topic.into());
         let request = Request::Unsubscribe(unsubscribe);
@@ -214,28 +231,19 @@ impl AsyncClient {
         Ok(())
     }
 
-    /// Sends a MQTT disconnect to the `EventLoop`
+    /// Sends a MQTT disconnect to the `MqttMtdEventLoop`
     pub async fn disconnect(&self) -> Result<(), ClientError> {
         let request = Request::Disconnect(Disconnect);
         self.request_tx.send_async(request).await?;
         Ok(())
     }
 
-    /// Attempts to send a MQTT disconnect to the `EventLoop`
+    /// Attempts to send a MQTT disconnect to the `MqttMtdEventLoop`
     pub fn try_disconnect(&self) -> Result<(), ClientError> {
         let request = Request::Disconnect(Disconnect);
         self.request_tx.try_send(request)?;
         Ok(())
     }
-}
-
-pub(super) fn get_ack_req(publish: &Publish) -> Option<Request> {
-    let ack = match publish.qos {
-        QoS::AtMostOnce => return None,
-        QoS::AtLeastOnce => Request::PubAck(PubAck::new(publish.pkid)),
-        QoS::ExactlyOnce => Request::PubRec(PubRec::new(publish.pkid)),
-    };
-    Some(ack)
 }
 
 /// A synchronous client, communicates with MQTT `EventLoop`.
@@ -249,23 +257,34 @@ pub(super) fn get_ack_req(publish: &Publish) -> Option<Request> {
 ///
 /// An asynchronous channel handle can also be extracted if necessary.
 #[derive(Clone)]
-pub struct Client {
-    client: AsyncClient,
+pub struct MqttMtdClient<
+    H: HmacHandler,
+    E: KeyAgreementHandler,
+    A: AeadHandler,
+    D: DigitalSignatureHandler,
+> {
+    client: MqttMtdAsyncClient<H, E, A, D>,
 }
 
-impl Client {
+impl<H: HmacHandler, E: KeyAgreementHandler, A: AeadHandler, D: DigitalSignatureHandler>
+    MqttMtdClient<H, E, A, D>
+{
     /// Create a new `Client`
     ///
     /// `cap` specifies the capacity of the bounded async channel.
-    pub fn new(options: MqttOptions, cap: usize) -> (Client, Connection) {
-        let (client, eventloop) = AsyncClient::new(options, cap);
-        let client = Client { client };
+    pub fn new<'a>(
+        options: MqttOptions,
+        mtd_options: MqttMtdClientOptions<'a, H, E, A, D>,
+        cap: usize,
+    ) -> (MqttMtdClient<H, E, A, D>, MqttMtdConnection<'a, H, E, A, D>) {
+        let (client, eventloop) = MqttMtdAsyncClient::new(options, mtd_options, cap);
+        let client = MqttMtdClient { client };
         let runtime = runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
 
-        let connection = Connection::new(eventloop, runtime);
+        let connection = MqttMtdConnection::new(eventloop, runtime);
         (client, connection)
     }
 
@@ -273,9 +292,9 @@ impl Client {
     ///
     /// This is mostly useful for creating a test instance where you can
     /// listen on the corresponding receiver.
-    pub fn from_sender(request_tx: Sender<Request>) -> Client {
-        Client {
-            client: AsyncClient::from_senders(request_tx),
+    pub fn from_sender(request_tx: Sender<Request>) -> MqttMtdClient<H, E, A, D> {
+        MqttMtdClient {
+            client: MqttMtdAsyncClient::<H, E, A, D>::from_senders(request_tx),
         }
     }
 
@@ -399,45 +418,24 @@ impl Client {
     }
 }
 
-#[must_use]
-pub(super) fn subscribe_has_valid_filters(subscribe: &Subscribe) -> bool {
-    !subscribe.filters.is_empty()
-        && subscribe
-            .filters
-            .iter()
-            .all(|filter| valid_filter(&filter.path))
-}
-
-/// Error type returned by [`Connection::recv`]
-#[derive(Debug, Eq, PartialEq)]
-pub struct RecvError;
-
-/// Error type returned by [`Connection::try_recv`]
-#[derive(Debug, Eq, PartialEq)]
-pub enum TryRecvError {
-    /// User has closed requests channel
-    Disconnected,
-    /// Did not resolve
-    Empty,
-}
-
-/// Error type returned by [`Connection::recv_timeout`]
-#[derive(Debug, Eq, PartialEq)]
-pub enum RecvTimeoutError {
-    /// User has closed requests channel
-    Disconnected,
-    /// Recv request timedout
-    Timeout,
-}
-
-///  MQTT connection. Maintains all the necessary state
-pub struct Connection {
-    pub eventloop: EventLoop,
+pub struct MqttMtdConnection<
+    'a,
+    H: HmacHandler,
+    E: KeyAgreementHandler,
+    A: AeadHandler,
+    D: DigitalSignatureHandler,
+> {
+    pub eventloop: MqttMtdEventLoop<'a, H, E, A, D>,
     runtime: Runtime,
 }
-impl Connection {
-    fn new(eventloop: EventLoop, runtime: Runtime) -> Connection {
-        Connection { eventloop, runtime }
+impl<'a, H: HmacHandler, E: KeyAgreementHandler, A: AeadHandler, D: DigitalSignatureHandler>
+    MqttMtdConnection<'a, H, E, A, D>
+{
+    fn new(
+        eventloop: MqttMtdEventLoop<'a, H, E, A, D>,
+        runtime: Runtime,
+    ) -> MqttMtdConnection<'a, H, E, A, D> {
+        MqttMtdConnection { eventloop, runtime }
     }
 
     /// Returns an iterator over this connection. Iterating over this is all that's
@@ -447,8 +445,8 @@ impl Connection {
     // ideally this should be named iter_mut because it requires a mutable reference
     // Also we can implement IntoIter for this to make it easy to iterate over it
     #[must_use = "Connection should be iterated over a loop to make progress"]
-    pub fn iter(&mut self) -> Iter<'_> {
-        Iter { connection: self }
+    pub fn iter(&mut self) -> MqttMtdIter<'a, '_, H, E, A, D> {
+        MqttMtdIter { connection: self }
     }
 
     /// Attempt to fetch an incoming [`Event`] on the [`EventLoop`], returning an error
@@ -494,59 +492,24 @@ impl Connection {
     }
 }
 
-pub(super) fn resolve_event(
-    event: Result<Event, ConnectionError>,
-) -> Option<Result<Event, ConnectionError>> {
-    match event {
-        Ok(v) => Some(Ok(v)),
-        // closing of request channel should stop the iterator
-        Err(ConnectionError::RequestsDone) => {
-            trace!("Done with requests");
-            None
-        }
-        Err(e) => Some(Err(e)),
-    }
-}
-
 /// Iterator which polls the `EventLoop` for connection progress
-pub struct Iter<'a> {
-    connection: &'a mut Connection,
+pub struct MqttMtdIter<
+    'a,
+    'b,
+    H: HmacHandler,
+    E: KeyAgreementHandler,
+    A: AeadHandler,
+    D: DigitalSignatureHandler,
+> {
+    connection: &'a mut MqttMtdConnection<'b, H, E, A, D>,
 }
 
-impl Iterator for Iter<'_> {
+impl<H: HmacHandler, E: KeyAgreementHandler, A: AeadHandler, D: DigitalSignatureHandler> Iterator
+    for MqttMtdIter<'_, '_, H, E, A, D>
+{
     type Item = Result<Event, ConnectionError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.connection.recv().ok()
-    }
-}
-
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn calling_iter_twice_on_connection_shouldnt_panic() {
-        use std::time::Duration;
-
-        let mut mqttoptions = MqttOptions::new("test-1", "localhost", 1883);
-        let will = LastWill::new("hello/world", "good bye", QoS::AtMostOnce, false);
-        mqttoptions
-            .set_keep_alive(Duration::from_secs(5))
-            .set_last_will(will);
-
-        let (_, mut connection) = Client::new(mqttoptions, 10);
-        let _ = connection.iter();
-        let _ = connection.iter();
-    }
-
-    #[test]
-    fn should_be_able_to_build_test_client_from_channel() {
-        let (tx, rx) = flume::bounded(1);
-        let client = Client::from_sender(tx);
-        client
-            .publish("hello/world", QoS::ExactlyOnce, false, "good bye")
-            .expect("Should be able to publish");
-        let _ = rx.try_recv().expect("Should have message");
     }
 }

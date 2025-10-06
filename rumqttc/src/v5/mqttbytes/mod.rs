@@ -152,6 +152,8 @@ pub enum Error {
     InvalidQoS(u8),
     #[error("Invalid subscribe reason code = {0}")]
     InvalidSubscribeReasonCode(u8),
+    #[error("Invalid preconnect payload type = {0}")]
+    InvalidPreconnectPayloadType(u8),
     #[error("Packet received has id Zero")]
     PacketIdZero,
     #[error("Empty Subscription")]

@@ -605,30 +605,54 @@ impl LastWillProperties {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Login {
-    pub username: String,
-    pub password: String,
+    pub username: Option<String>, // optional per spec
+    pub password: Bytes,          // binary per spec
 }
 
 impl Login {
     pub fn new<U: Into<String>, P: Into<String>>(u: U, p: P) -> Login {
+        let p = p.into();
         Login {
-            username: u.into(),
-            password: p.into(),
+            username: Some(u.into()),
+            password: Bytes::copy_from_slice(p.as_bytes()),
+        }
+    }
+
+    pub fn new_without_username<P: Into<String>>(p: P) -> Login {
+        let p = p.into();
+        Login {
+            username: None,
+            password: Bytes::copy_from_slice(p.as_bytes()),
+        }
+    }
+
+    pub fn new_bytes<U: Into<String>>(u: U, p: Bytes) -> Login {
+        Login {
+            username: Some(u.into()),
+            password: p,
+        }
+    }
+
+    pub fn new_bytes_without_username(p: Bytes) -> Login {
+        let p = p.into();
+        Login {
+            username: None,
+            password: p,
         }
     }
 
     pub fn read(connect_flags: u8, bytes: &mut Bytes) -> Result<Option<Login>, Error> {
         let username = match connect_flags & 0b1000_0000 {
-            0 => String::new(),
-            _ => read_mqtt_string(bytes)?,
+            0 => None,
+            _ => Some(read_mqtt_string(bytes)?),
         };
 
         let password = match connect_flags & 0b0100_0000 {
-            0 => String::new(),
-            _ => read_mqtt_string(bytes)?,
+            0 => Bytes::new(),
+            _ => read_mqtt_bytes(bytes)?,
         };
 
-        if username.is_empty() && password.is_empty() {
+        if username.is_none() && password.is_empty() {
             Ok(None)
         } else {
             Ok(Some(Login { username, password }))
@@ -638,8 +662,8 @@ impl Login {
     fn len(&self) -> usize {
         let mut len = 0;
 
-        if !self.username.is_empty() {
-            len += 2 + self.username.len();
+        if let Some(ref username) = self.username {
+            len += 2 + username.len();
         }
 
         if !self.password.is_empty() {
@@ -651,14 +675,14 @@ impl Login {
 
     pub fn write(&self, buffer: &mut BytesMut) -> u8 {
         let mut connect_flags = 0;
-        if !self.username.is_empty() {
+        if let Some(ref username) = self.username {
             connect_flags |= 0x80;
-            write_mqtt_string(buffer, &self.username);
+            write_mqtt_string(buffer, &username);
         }
 
         if !self.password.is_empty() {
             connect_flags |= 0x40;
-            write_mqtt_string(buffer, &self.password);
+            write_mqtt_bytes(buffer, &self.password);
         }
 
         connect_flags

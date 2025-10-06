@@ -4,7 +4,15 @@ use crate::{MqttOptions, Outgoing};
 
 use crate::framed::AsyncReadWrite;
 use crate::mqttbytes::v4::*;
+use bytes::BytesMut;
 use flume::{bounded, Receiver, Sender};
+use libmqttmtd::authreq::TopicString;
+use libmqttmtd::crypto::aead::{AeadHandler, TAG_LEN};
+use libmqttmtd::crypto::ephemeral::KeyAgreementHandler;
+use libmqttmtd::crypto::hmac::HmacHandler;
+use libmqttmtd::crypto::signature::DigitalSignatureHandler;
+use libmqttmtd::handshake::client::{ClientHandshaker, MqttMtdClientOptions};
+use libmqttmtd::session::{MessageDirection, MessageInfo, MessageSenderRole, SessionContext};
 use tokio::net::{lookup_host, TcpSocket, TcpStream};
 use tokio::select;
 use tokio::time::{self, Instant, Sleep};
@@ -13,6 +21,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(unix)]
@@ -66,6 +75,11 @@ pub enum ConnectionError {
     #[cfg(feature = "websocket")]
     #[error("Websocket response validation error: ")]
     ResponseValidation(#[from] crate::websockets::ValidationError),
+
+    #[error("MQTT-MTD Handshake Failed: {0}")]
+    MqttMtdHandshakeFailed(libmqttmtd::error::Error),
+    #[error("MQTT-MTD Failed")]
+    MqttMtdFailed,
 }
 
 /// Eventloop with all the state of a connection
@@ -502,4 +516,462 @@ async fn mqtt_connect(
         Incoming::ConnAck(connack) => Err(ConnectionError::ConnectionRefused(connack.code)),
         packet => Err(ConnectionError::NotConnAck(packet)),
     }
+}
+
+/// Eventloop with all the state of a connection
+pub struct MqttMtdEventLoop<
+    'a,
+    H: HmacHandler,
+    E: KeyAgreementHandler,
+    A: AeadHandler,
+    D: DigitalSignatureHandler,
+> {
+    /// Options of the current mqtt connection
+    pub mqtt_options: MqttOptions,
+    /// Current state of the connection
+    pub state: MqttState,
+    /// Request stream
+    requests_rx: Receiver<Request>,
+    /// Requests handle to send requests
+    pub(crate) requests_tx: Sender<Request>,
+    /// Pending packets from last session
+    pub pending: VecDeque<Request>,
+    /// Network connection to the broker
+    pub network: Option<Network>,
+    /// Keep alive time
+    keepalive_timeout: Option<Pin<Box<Sleep>>>,
+    pub network_options: NetworkOptions,
+
+    pub mqttmtd_session_ctx: Option<SessionContext<H, A>>,
+    pub mqttmtd_options: MqttMtdClientOptions<'a, H, E, A, D>,
+}
+
+impl<'a, H: HmacHandler, E: KeyAgreementHandler, A: AeadHandler, D: DigitalSignatureHandler>
+    MqttMtdEventLoop<'a, H, E, A, D>
+{
+    /// New MQTT `EventLoop`
+    ///
+    /// When connection encounters critical errors (like auth failure), user has a choice to
+    /// access and update `options`, `state` and `requests`.
+    pub fn new(
+        mqtt_options: MqttOptions,
+        mqttmtd_options: MqttMtdClientOptions<'a, H, E, A, D>,
+        cap: usize,
+    ) -> MqttMtdEventLoop<'a, H, E, A, D> {
+        let (requests_tx, requests_rx) = bounded(cap);
+        let pending = VecDeque::new();
+        let max_inflight = mqtt_options.inflight;
+        let manual_acks = mqtt_options.manual_acks;
+
+        MqttMtdEventLoop {
+            mqtt_options,
+            state: MqttState::new(max_inflight, manual_acks),
+            requests_tx,
+            requests_rx,
+            pending,
+            network: None,
+            keepalive_timeout: None,
+            network_options: NetworkOptions::new(),
+            mqttmtd_session_ctx: None,
+            mqttmtd_options,
+        }
+    }
+
+    /// Last session might contain packets which aren't acked. MQTT says these packets should be
+    /// republished in the next session. Move pending messages from state to eventloop, drops the
+    /// underlying network connection and clears the keepalive timeout if any.
+    ///
+    /// > NOTE: Use only when EventLoop is blocked on network and unable to immediately handle disconnect.
+    /// > Also, while this helps prevent data loss, the pending list length should be managed properly.
+    /// > For this reason we recommend setting [`AsycClient`](crate::AsyncClient)'s channel capacity to `0`.
+    pub fn clean(&mut self) {
+        self.network = None;
+        self.keepalive_timeout = None;
+        self.pending.extend(self.state.clean());
+
+        // drain requests from channel which weren't yet received
+        let mut requests_in_channel: Vec<_> = self.requests_rx.drain().collect();
+
+        requests_in_channel.retain(|request| {
+            match request {
+                Request::PubAck(_) => false, // Wait for publish retransmission, else the broker could be confused by an unexpected ack
+                _ => true,
+            }
+        });
+
+        self.pending.extend(requests_in_channel);
+    }
+
+    /// Yields Next notification or outgoing request and periodically pings
+    /// the broker. Continuing to poll will reconnect to the broker if there is
+    /// a disconnection.
+    /// **NOTE** Don't block this while iterating
+    pub async fn poll(&mut self) -> Result<Event, ConnectionError> {
+        if self.network.is_none() {
+            let (network, (connack, session_ctx)) = match time::timeout(
+                Duration::from_secs(self.network_options.connection_timeout()),
+                connect_with_mtd(
+                    &self.mqtt_options,
+                    &self.mqttmtd_options,
+                    self.network_options.clone(),
+                ),
+            )
+            .await
+            {
+                Ok(inner) => inner?,
+                Err(_) => return Err(ConnectionError::NetworkTimeout),
+            };
+            // Last session might contain packets which aren't acked. If it's a new session, clear the pending packets.
+            if !connack.session_present {
+                self.pending.clear();
+            }
+            self.network = Some(network);
+            self.mqttmtd_session_ctx = Some(session_ctx);
+
+            if self.keepalive_timeout.is_none() && !self.mqtt_options.keep_alive.is_zero() {
+                self.keepalive_timeout = Some(Box::pin(time::sleep(self.mqtt_options.keep_alive)));
+            }
+
+            return Ok(Event::Incoming(Packet::ConnAck(connack)));
+        }
+
+        match self.select().await {
+            Ok(v) => Ok(v),
+            Err(e) => {
+                // MQTT requires that packets pending acknowledgement should be republished on session resume.
+                // Move pending messages from state to eventloop.
+                self.clean();
+                Err(e)
+            }
+        }
+    }
+
+    /// Select on network and requests and generate keepalive pings when necessary
+    async fn select(&mut self) -> Result<Event, ConnectionError> {
+        let network = self.network.as_mut().unwrap();
+        // let await_acks = self.state.await_acks;
+        let inflight_full = self.state.inflight >= self.mqtt_options.inflight;
+        let collision = self.state.collision.is_some();
+        let network_timeout = Duration::from_secs(self.network_options.connection_timeout());
+
+        // Read buffered events from previous polls before calling a new poll
+        if let Some(event) = self.state.events.pop_front() {
+            return Ok(event);
+        }
+
+        let mut no_sleep = Box::pin(time::sleep(Duration::ZERO));
+        // this loop is necessary since self.incoming.pop_front() might return None. In that case,
+        // instead of returning a None event, we try again.
+        select! {
+            // Pull a bunch of packets from network, reply in bunch and yield the first item
+            o = network.readb(&mut self.state) => {
+                o?;
+                // flush all the acks and return first incoming packet
+                match time::timeout(network_timeout, network.flush()).await {
+                    Ok(inner) => inner?,
+                    Err(_)=> return Err(ConnectionError::FlushTimeout),
+                };
+                match self.state.events.pop_front().unwrap() {
+                    Event::Incoming(Incoming::Publish(mut publish)) => {
+                        if let Some(mut ctx) = self.mqttmtd_session_ctx.as_mut() {
+                            decode_publish(&mut ctx, &mut publish)?;
+                        }
+                        Ok(Event::Incoming(Incoming::Publish(publish)))
+                    }
+                    others => Ok(others)
+                }
+            },
+             // Handles pending and new requests.
+            // If available, prioritises pending requests from previous session.
+            // Else, pulls next request from user requests channel.
+            // If conditions in the below branch are for flow control.
+            // The branch is disabled if there's no pending messages and new user requests
+            // cannot be serviced due flow control.
+            // We read next user user request only when inflight messages are < configured inflight
+            // and there are no collisions while handling previous outgoing requests.
+            //
+            // Flow control is based on ack count. If inflight packet count in the buffer is
+            // less than max_inflight setting, next outgoing request will progress. For this
+            // to work correctly, broker should ack in sequence (a lot of brokers won't)
+            //
+            // E.g If max inflight = 5, user requests will be blocked when inflight queue
+            // looks like this                 -> [1, 2, 3, 4, 5].
+            // If broker acking 2 instead of 1 -> [1, x, 3, 4, 5].
+            // This pulls next user request. But because max packet id = max_inflight, next
+            // user request's packet id will roll to 1. This replaces existing packet id 1.
+            // Resulting in a collision
+            //
+            // Eventloop can stop receiving outgoing user requests when previous outgoing
+            // request collided. I.e collision state. Collision state will be cleared only
+            // when correct ack is received
+            // Full inflight queue will look like -> [1a, 2, 3, 4, 5].
+            // If 3 is acked instead of 1 first   -> [1a, 2, x, 4, 5].
+            // After collision with pkid 1        -> [1b ,2, x, 4, 5].
+            // 1a is saved to state and event loop is set to collision mode stopping new
+            // outgoing requests (along with 1b).
+            o = Self::next_request(
+                &mut self.pending,
+                &self.requests_rx,
+                self.mqtt_options.pending_throttle
+            ), if !self.pending.is_empty() || (!inflight_full && !collision) => match o {
+                Ok(request) => {
+                    if let Some(outgoing) = self.state.handle_outgoing_packet(request)? {
+                        let outgoing = match outgoing {
+                            Packet::Publish(mut publish) => {
+                                if let Some(ctx) = self.mqttmtd_session_ctx.as_mut() {
+                                    encode_publish(ctx, &mut publish)?;
+                                }
+                                Packet::Publish(publish)
+                            }
+                            Packet::Subscribe(mut subscribe) => {
+                                if let Some(ctx) = self.mqttmtd_session_ctx.as_mut() {
+                                    encode_subscribe(ctx, &mut subscribe)?;
+                                }
+                                Packet::Subscribe(subscribe)
+                            }
+                            others => others,
+                        };
+                        network.write(outgoing).await?;
+                    }
+                    match time::timeout(network_timeout, network.flush()).await {
+                        Ok(inner) => inner?,
+                        Err(_)=> return Err(ConnectionError::FlushTimeout),
+                    };
+                    Ok(self.state.events.pop_front().unwrap())
+                }
+                Err(_) => Err(ConnectionError::RequestsDone),
+            },
+            // We generate pings irrespective of network activity. This keeps the ping logic
+            // simple. We can change this behavior in future if necessary (to prevent extra pings)
+            _ = self.keepalive_timeout.as_mut().unwrap_or(&mut no_sleep),
+                if self.keepalive_timeout.is_some() && !self.mqtt_options.keep_alive.is_zero() => {
+                let timeout = self.keepalive_timeout.as_mut().unwrap();
+                timeout.as_mut().reset(Instant::now() + self.mqtt_options.keep_alive);
+
+                if let Some(outgoing) = self.state.handle_outgoing_packet(Request::PingReq(PingReq))? {
+                    network.write(outgoing).await?;
+                }
+                match time::timeout(network_timeout, network.flush()).await {
+                    Ok(inner) => inner?,
+                    Err(_)=> return Err(ConnectionError::FlushTimeout),
+                };
+                Ok(self.state.events.pop_front().unwrap())
+            }
+        }
+    }
+
+    pub fn network_options(&self) -> NetworkOptions {
+        self.network_options.clone()
+    }
+
+    pub fn set_network_options(&mut self, network_options: NetworkOptions) -> &mut Self {
+        self.network_options = network_options;
+        self
+    }
+
+    async fn next_request(
+        pending: &mut VecDeque<Request>,
+        rx: &Receiver<Request>,
+        pending_throttle: Duration,
+    ) -> Result<Request, ConnectionError> {
+        if !pending.is_empty() {
+            time::sleep(pending_throttle).await;
+            // We must call .pop_front() AFTER sleep() otherwise we would have
+            // advanced the iterator but the future might be canceled before return
+            Ok(pending.pop_front().unwrap())
+        } else {
+            match rx.recv_async().await {
+                Ok(r) => Ok(r),
+                Err(_) => Err(ConnectionError::RequestsDone),
+            }
+        }
+    }
+}
+
+/// This stream internally processes requests from the request stream provided to the eventloop
+/// while also consuming byte stream from the network and yielding mqtt packets as the output of
+/// the stream.
+/// This function (for convenience) includes internal delays for users to perform internal sleeps
+/// between re-connections so that cancel semantics can be used during this sleep
+async fn connect_with_mtd<
+    H: HmacHandler,
+    E: KeyAgreementHandler,
+    A: AeadHandler,
+    D: DigitalSignatureHandler,
+>(
+    mqtt_options: &MqttOptions,
+    mqttmtd_options: &MqttMtdClientOptions<'_, H, E, A, D>,
+    network_options: NetworkOptions,
+) -> Result<(Network, (ConnAck, SessionContext<H, A>)), ConnectionError> {
+    // connect to the broker
+    let mut network = network_connect(mqtt_options, network_options).await?;
+
+    // make MQTT connection request (which internally awaits for ack)
+    let session_ctx = mqttmtd_connect(mqtt_options, mqttmtd_options, &mut network).await?;
+
+    Ok((network, session_ctx))
+}
+
+async fn mqttmtd_connect<
+    H: HmacHandler,
+    E: KeyAgreementHandler,
+    A: AeadHandler,
+    D: DigitalSignatureHandler,
+>(
+    options: &MqttOptions,
+    mqttmtd_options: &MqttMtdClientOptions<'_, H, E, A, D>,
+    network: &mut Network,
+) -> Result<(ConnAck, SessionContext<H, A>), ConnectionError> {
+    let mut handshake_buf = BytesMut::with_capacity(mqttmtd_options.buffer_capacity);
+
+    let mut handshaker = ClientHandshaker::<H, E, A, D>::new();
+    let ephemeral = handshaker
+        .build_client_hello(&mut handshake_buf)
+        .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+
+    // send ClientHello over preconnect
+    let preconnect = PreConnect::new(PayloadType::ClientHello, handshake_buf.split().freeze());
+    network.write(Packet::PreConnect(preconnect)).await?;
+    network.flush().await?;
+
+    handshaker
+        .post_client_hello()
+        .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+
+    // receive ServerHello over preconnect
+    let preconnect = match network.read().await? {
+        Incoming::PreConnect(preconnect) if preconnect.payload_type == PayloadType::ServerHello => {
+            Ok(preconnect)
+        }
+        packet => Err(ConnectionError::NotConnAck(packet)),
+    }?;
+    handshaker
+        .on_server_hello(&preconnect.payload, ephemeral)
+        .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+
+    // receive ServerAuth over preconnect
+    match network.read().await? {
+        Incoming::PreConnect(preconnect) if preconnect.payload_type == PayloadType::ServerAuth => {
+            handshake_buf.extend_from_slice(&preconnect.payload);
+            Ok(())
+        }
+        packet => Err(ConnectionError::NotConnAck(packet)),
+    }?;
+    handshaker
+        .on_server_auth(&mut handshake_buf, &mqttmtd_options.server_cv_verifier)
+        .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+
+    handshake_buf.clear();
+    handshaker
+        .build_client_auth(
+            &mqttmtd_options.auth_req,
+            &mqttmtd_options.client_cv_signer,
+            &mqttmtd_options.cert_chain,
+            &mut handshake_buf,
+        )
+        .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+    handshaker
+        .write_encrypted_client_auth(&mut handshake_buf)
+        .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+
+    // send ClientAuth over mqtt connect packet
+    let mut connect = Connect::new(options.client_id());
+    connect.keep_alive = options.keep_alive().as_secs() as u16;
+    connect.clean_session = options.clean_session();
+    connect.last_will = options.last_will();
+    connect.login = Some(Login::new_bytes("mtd", handshake_buf.split().freeze()));
+
+    network.write(Packet::Connect(connect)).await?;
+    network.flush().await?;
+
+    handshaker
+        .post_client_auth()
+        .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+    let session_ctx = SessionContext::new(
+        libmqttmtd::authreq::IndependentAuthRequest::Static(Arc::new(
+            mqttmtd_options.auth_req.clone(),
+        )),
+        handshaker,
+    )
+    .map_err(|e| ConnectionError::MqttMtdHandshakeFailed(e))?;
+
+    // validate connack
+    match network.read().await? {
+        Incoming::ConnAck(connack) if connack.code == ConnectReturnCode::Success => {
+            Ok((connack, session_ctx))
+        }
+        Incoming::ConnAck(connack) => Err(ConnectionError::ConnectionRefused(connack.code)),
+        packet => Err(ConnectionError::NotConnAck(packet)),
+    }
+}
+
+fn encode_publish<H: HmacHandler, A: AeadHandler>(
+    ctx: &mut SessionContext<H, A>,
+    publish: &mut Publish,
+) -> Result<(), ConnectionError> {
+    let msg_info = MessageInfo {
+        direction: MessageDirection::ClientToServer,
+        packet_id: 0, // TODO
+        sender_role: MessageSenderRole::Publisher,
+    };
+    let mut encrypted = BytesMut::with_capacity(publish.payload.len() + TAG_LEN);
+    encrypted.extend(&publish.payload);
+    let (token, tag) = ctx
+        .encode_publish_in_place_with_name(&msg_info, publish.topic.as_str().into(), &mut encrypted)
+        .map_err(|_| ConnectionError::MqttMtdFailed)?;
+    encrypted.extend_from_slice(tag.as_ref());
+    publish.payload = encrypted.freeze();
+    publish.topic = str::from_utf8(&[token])
+        .map_err(|_| ConnectionError::MqttMtdFailed)?
+        .to_owned();
+    Ok(())
+}
+
+fn decode_publish<H: HmacHandler, A: AeadHandler>(
+    ctx: &mut SessionContext<H, A>,
+    publish: &mut Publish,
+) -> Result<(), ConnectionError> {
+    let msg_info = MessageInfo {
+        direction: MessageDirection::ServerToClient,
+        packet_id: 0, // TODO
+        sender_role: MessageSenderRole::Subscriber,
+    };
+    let mut decrypted = BytesMut::from_iter(&publish.payload);
+    let topic = ctx
+        .decode_publish_in_place_with_name(&msg_info, publish.topic.as_bytes()[0], &mut decrypted)
+        .map_err(|_| ConnectionError::MqttMtdFailed)?;
+    decrypted.truncate(publish.payload.len() - TAG_LEN);
+    publish.payload = decrypted.freeze();
+    publish.topic = str::from_utf8(topic.as_ref())
+        .map_err(|_| ConnectionError::MqttMtdFailed)?
+        .to_owned();
+    Ok(())
+}
+
+fn encode_subscribe<H: HmacHandler, A: AeadHandler>(
+    ctx: &mut SessionContext<H, A>,
+    subscribe: &mut Subscribe,
+) -> Result<(), ConnectionError> {
+    let msg_info = MessageInfo {
+        direction: MessageDirection::ClientToServer,
+        packet_id: 0, // TODO
+        sender_role: MessageSenderRole::Publisher,
+    };
+    let converted = subscribe
+        .filters
+        .iter()
+        .map(|f| TopicString::from(f.path.as_str()))
+        .collect::<Vec<TopicString<'_>>>();
+    let topics = ctx
+        .encode_subscribe_with_filters(&msg_info, converted.iter())
+        .map_err(|_| ConnectionError::MqttMtdFailed)?;
+    subscribe.filters = topics
+        .iter()
+        .map(|f| {
+            str::from_utf8(&[*f])
+                .map_err(|_| ConnectionError::MqttMtdFailed)
+                .map(|s| SubscribeFilter::new(s.to_owned(), crate::QoS::AtMostOnce))
+        })
+        .collect::<Result<Vec<_>, ConnectionError>>()?;
+    Ok(())
 }

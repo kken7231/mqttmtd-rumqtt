@@ -9,6 +9,7 @@ use super::{Event, Incoming, Outgoing, Request};
 
 use bytes::Bytes;
 use fixedbitset::FixedBitSet;
+use log::{debug, error, info, warn};
 use std::collections::{HashMap, VecDeque};
 use std::{io, time::Instant};
 

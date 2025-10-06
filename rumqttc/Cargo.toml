@@ -24,6 +24,9 @@ websocket = ["dep:async-tungstenite", "dep:ws_stream_tungstenite", "dep:http"]
 proxy = ["dep:async-http-proxy"]
 
 [dependencies]
+# libmqttmtd = { git = "https://github.com/kken7231/libmqttmtd-rs.git" }
+libmqttmtd = { path = "../../libmqttmtd-rs", default-features = false, features = ["client", "rust_crypto"] }
+
 futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
 tokio = { version = "1.36", features = ["rt", "macros", "io-util", "net", "time"] }
 tokio-util = { version = "0.7", features = ["codec"] }
@@ -59,6 +62,26 @@ matches = "0.1"
 pretty_assertions = "1"
 pretty_env_logger = "0.5"
 serde = { version = "1", features = ["derive"] }
+
+[[example]]
+name = "async_mtd"
+path = "examples/asyncpubsub_mtd.rs"
+required-features = ["libmqttmtd/crypto_ring", "std"]
+
+[[example]]
+name = "async_mtdv5"
+path = "examples/asyncpubsub_mtd_v5.rs"
+required-features = ["libmqttmtd/crypto_ring", "std"]
+
+[[example]]
+name = "sync_mtd"
+path = "examples/syncpubsub_mtd.rs"
+required-features = ["libmqttmtd/crypto_ring", "std"]
+
+[[example]]
+name = "sync_mtdv5"
+path = "examples/syncpubsub_mtd_v5.rs"
+required-features = ["libmqttmtd/crypto_ring", "std"]
 
 [[example]]
 name = "tls"
